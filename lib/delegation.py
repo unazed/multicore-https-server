@@ -1,33 +1,40 @@
-from asocket import ASocketServer
+from .asocket import ASocketServer
+from . import consts
 from multiprocessing import Process, Pipe
-import consts
 import os
 import select
 import socket
 
 
-class DelegateProtocol:
-    def connection_made(self, trans):
-        print("connected on process")
+class BaseProtocol:
+    def connection_made(self):
+        pass
 
     def connection_lost(self):
-        print("lost connection")
+        pass
 
-    def data_received(self, data):
-        print("got", data, "on process")
+    def data_received(self):
+        pass
 
 
 class Delegate:
-    def __init__(self, master, delay, recv_size, prot):
+    def __init__(self, master, delay, recv_size, prot, aff):
         self.master = master
         self.delay = delay
         self.recv_size = recv_size
+
         self.prot = prot()
+        self.prot.delegate = self
+        
         self.ident = os.getpid()
+        os.sched_setaffinity(self.ident, {aff})
 
         self.sockets = {}
         
-        self.serve_forever()
+        try:
+            self.serve_forever()
+        except KeyboardInterrupt:
+            print("closing", self.ident)
 
     def serve_forever(self):
         while 1:
@@ -35,15 +42,29 @@ class Delegate:
                 for fd, pair in self.sockets.copy().items():
                     sock, poll = pair
                     if not (ev := poll.poll(self.delay)):
-                        continue
+                        sock.close()
+                        del self.sockets[fd]
+                        self.prot.trans = sock
+                        self.prot.connection_lost()
                     elif ev[0][1] & select.POLLHUP:
                         sock.close()
                         del self.sockets[fd]
+                        self.prot.trans = sock
                         self.prot.connection_lost()
                     elif ev[0][1] & select.POLLIN:
                         data = sock.recv(self.recv_size)
                         while (ev := poll.poll(self.delay)) and ev[0][1] & select.POLLIN:
-                            data += sock.recv(self.recv_size)
+                            recv = sock.recv(self.recv_size)
+                            if not recv:
+                                sock.close()
+                                del self.sockets[fd]
+                                self.prot.trans = sock
+                                self.prot.connection_lost()
+                                break
+                            data += recv
+                        if not data:
+                            continue
+                        self.prot.trans = sock
                         self.prot.data_received(data)
                 continue
 
@@ -65,17 +86,19 @@ class Delegate:
                 self.master.send({
                     "status": consts.SLAVE_COMMS['ack']
                     })
+                self.prot.trans = s
+                self.prot.connection_made()
                 continue
 
 
 class DelegatorProtocol:
-    def __init__(self, bin_count, delay, recv_size):
+    def __init__(self, bin_count, delay, recv_size, prot):
         self.procs = []
         self.bin_count = bin_count
-        for _ in range(bin_count):
+        for aff in range(bin_count):
             master, slave = Pipe()
             self.procs.append( ((p := Process(target=Delegate, args=(
-                    slave, delay, recv_size, DelegateProtocol
+                    slave, delay, recv_size, prot, aff
                 ))), master) )
             p.start()
         self.curr_idx = 0
@@ -123,11 +146,7 @@ class DelegatorProtocol:
         self.curr_idx %= self.bin_count
 
 
-def start_delegating(host, port, *args, bin_count=os.cpu_count(), **kwargs):
+def start_delegating(host, port, protocol, *args, bin_count=os.cpu_count(), **kwargs):
         server = ASocketServer(host, port, *args, **kwargs)
-        server.listen_and_accept(DelegatorProtocol(bin_count, server.delay, server.recv_size))
+        server.listen_and_accept(DelegatorProtocol(bin_count, server.delay, server.recv_size, protocol))
 
-
-if __name__ == "__main__":
-    print("starting server")
-    start_delegating('', 32768)

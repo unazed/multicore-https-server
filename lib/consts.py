@@ -7,3 +7,5 @@ SLAVE_COMMS = {
 MSTR_COMMS = {
         "new": 0x01
         }
+
+CRLF = b"\r\n"
